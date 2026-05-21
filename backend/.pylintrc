@@ -1,0 +1,3 @@
+[TYPECHECK]
+# cv2 is a C extension — Pylint cannot introspect its members statically.
+generated-members=cv2.*

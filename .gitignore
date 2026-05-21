@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Model weights
+*.pt
+
+# Outputs & uploads
+backend/uploads/
+backend/outputs/
+
+# Test videos
+*.mp4
+*.avi
+*.mkv
+*.json
+
+# Node
+node_modules/
+
+# VSCode
+.vscode/
+
+# Vite build
+dist/
