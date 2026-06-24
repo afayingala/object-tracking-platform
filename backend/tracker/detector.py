@@ -5,7 +5,7 @@ import numpy as np
 
 class YOLODetector:
     """Wraps a YOLOv8 model to produce bounding-box detections from video frames."""
-    def __init__(self, model_name: str = "yolov8n.pt", confidence: float = 0.5):
+    def __init__(self, model_name: str = "yolov8s.pt", confidence: float = 0.5):
         self.model = YOLO(model_name)
         self.confidence = confidence
         self.class_names = self.model.names

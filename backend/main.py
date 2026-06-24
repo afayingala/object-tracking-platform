@@ -1,6 +1,8 @@
 import os
+import base64
 import uuid
 import asyncio
+import cv2
 from pathlib import Path
 from typing import Optional
 
@@ -9,13 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from tracker.pipeline import process_video
+from tracker.pipeline import process_video, preview_frame
 
-app = FastAPI(title="Object Tracking Platform API", version="1.0.0")
+app = FastAPI(title="Object Tracking Platform API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,9 +37,10 @@ ws_connections: dict[str, list] = {}
 
 
 class ProcessConfig(BaseModel):
-    confidence: float = 0.5
+    confidence: float = 0.60
     max_age: int = 90
-    min_hits: int = 1
+    min_hits: int = 3
+    selected_boxes: list[dict] = []   # [{x1,y1,x2,y2,class_name}, …] — 1 or 2 entries
 
 
 async def _broadcast(job_id: str, message: dict):
@@ -50,11 +53,10 @@ async def _broadcast(job_id: str, message: dict):
 
 def _run_pipeline(job_id: str, input_path: str, config: ProcessConfig):
     output_video = str(OUTPUT_DIR / f"{job_id}_output.mp4")
-    output_json = str(OUTPUT_DIR / f"{job_id}_data.json")
+    output_json  = str(OUTPUT_DIR / f"{job_id}_data.json")
 
     def progress_cb(pct: int):
         jobs[job_id]["progress"] = pct
-        # Schedule broadcast on the event loop
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -70,19 +72,19 @@ def _run_pipeline(job_id: str, input_path: str, config: ProcessConfig):
             input_path=input_path,
             output_video_path=output_video,
             output_json_path=output_json,
+            selected_boxes=config.selected_boxes,
             confidence=config.confidence,
             max_age=config.max_age,
             min_hits=config.min_hits,
             progress_callback=progress_cb,
         )
-        jobs[job_id]["status"] = "done"
+        jobs[job_id]["status"]   = "done"
         jobs[job_id]["progress"] = 100
-        jobs[job_id]["summary"] = {
-            "total_frames": summary["total_frames"],
-            "fps": summary["fps"],
-            "total_objects": summary["total_objects"],
-            "class_counts": summary["class_counts"],
-            "avg_track_duration_frames": summary["avg_track_duration_frames"],
+        jobs[job_id]["summary"]  = {
+            "total_frames":            summary["total_frames"],
+            "fps":                     summary["fps"],
+            "total_objects":           summary["total_objects"],
+            "targets":                 summary["targets"],
             "processing_time_seconds": summary["processing_time_seconds"],
         }
         try:
@@ -97,14 +99,14 @@ def _run_pipeline(job_id: str, input_path: str, config: ProcessConfig):
     except Exception:
         import traceback
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = traceback.format_exc()
+        jobs[job_id]["error"]  = traceback.format_exc()
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"message": "Object Tracking Platform API"}
+    return {"message": "Object Tracking Platform API v2"}
 
 
 @app.post("/api/upload")
@@ -113,7 +115,7 @@ async def upload_video(file: UploadFile = File(...)):
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {ext}. Use MP4, AVI, MOV, or MKV.")
 
-    video_id = str(uuid.uuid4())
+    video_id  = str(uuid.uuid4())
     save_path = UPLOAD_DIR / f"{video_id}{ext}"
 
     with open(save_path, "wb") as f:
@@ -123,19 +125,45 @@ async def upload_video(file: UploadFile = File(...)):
     return {"video_id": video_id, "filename": file.filename, "path": str(save_path)}
 
 
+@app.get("/api/preview/{video_id}")
+async def preview_video(video_id: str):
+    """
+    Extract the first frame, run YOLO detection, and return the frame as a
+    base64-encoded JPEG together with the list of detected bounding boxes.
+    The frontend uses this to let the user click and select target objects.
+    """
+    matches = list(UPLOAD_DIR.glob(f"{video_id}.*"))
+    if not matches:
+        raise HTTPException(404, "Video not found. Upload it first.")
+
+    frame, detections = preview_frame(str(matches[0]))
+
+    _, buf     = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    frame_b64  = base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    return JSONResponse({
+        "frame":      frame_b64,
+        "width":      frame.shape[1],
+        "height":     frame.shape[0],
+        "detections": detections,
+    })
+
+
 @app.post("/api/process/{video_id}")
 async def start_processing(
     video_id: str,
     config: ProcessConfig,
     background_tasks: BackgroundTasks,
 ):
-    # Find uploaded file
+    if not config.selected_boxes:
+        raise HTTPException(400, "No target boxes selected. Select at least one object.")
+
     matches = list(UPLOAD_DIR.glob(f"{video_id}.*"))
     if not matches:
         raise HTTPException(404, "Video not found. Upload it first.")
 
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "progress": 0, "summary": None, "error": None}
+    job_id        = str(uuid.uuid4())
+    jobs[job_id]  = {"status": "queued", "progress": 0, "summary": None, "error": None}
 
     background_tasks.add_task(_run_pipeline, job_id, str(matches[0]), config)
 
@@ -181,7 +209,6 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
     await websocket.accept()
     ws_connections.setdefault(job_id, []).append(websocket)
     try:
-        # Send current status immediately on connect
         job = jobs.get(job_id)
         if job:
             await websocket.send_json({"type": "status", **job})

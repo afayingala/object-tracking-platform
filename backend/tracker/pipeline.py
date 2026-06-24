@@ -1,371 +1,551 @@
-"""Video processing pipeline: YOLOv8 detection + Deep SORT tracking."""
-# pylint: disable=no-member  # cv2 is a C extension; Pylint cannot introspect its members
+"""Focused tracking pipeline for 1–2 selected object instances.
+
+Core matching algorithm (per target, per frame)
+------------------------------------------------
+1. Velocity prediction  — estimate where the target will be using a
+   weighted moving average of the last few displacements.  This is the
+   primary search window; matching against a predicted position rather
+   than the last detected position prevents losing fast-moving objects.
+
+2. Combined score       — 50 % motion (best of predicted-IoU and a
+   centre-distance score) + 50 % appearance (cosine similarity of
+   MobileNetV2 crop embeddings).  A per-dimension minimum ensures a
+   candidate must be plausible on BOTH axes before it is accepted,
+   which prevents snapping to a wrong nearby object that happens to
+   have a similar colour.
+
+3. Output smoothing     — the accepted bounding box is blended with the
+   previous smoothed box (EMA, α = 0.75) to remove per-frame YOLO
+   jitter from the output video.
+
+Re-identification (SEARCHING mode)
+-----------------------------------
+Entered after max_age consecutive missed frames.  Pure cosine-similarity
+search across all YOLO detections, gated by min_hits consecutive matches
+before committing.
+"""
 import cv2
 import json
 import math
 import time
+import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 from .detector import YOLODetector
 
-# Palette of distinct colors for track IDs
-COLORS = [
-    (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
-    (207, 210, 49), (72, 249, 10), (146, 204, 23), (61, 219, 134),
-    (26, 147, 52), (0, 212, 187), (44, 153, 168), (0, 194, 255),
-    (52, 69, 147), (100, 115, 255), (0, 24, 236), (132, 56, 255),
-    (82, 0, 133), (203, 56, 255), (255, 149, 200), (255, 55, 199),
+TARGET_COLORS = [
+    (255, 200,   0),   # amber — Target 1
+    (  0, 160, 255),   # blue  — Target 2
 ]
 
-
-def _color_for_id(track_id) -> tuple:
-    return COLORS[int(track_id) % len(COLORS)]
-
-
-# Sports ball is hard to detect during motion blur; run YOLO at this floor
-# for that class while keeping the user's threshold for everything else.
-_BALL_CONF_FLOOR = 0.30
-
-# Classes where only one physical object can exist at any moment.
-# The stitch ignores spatial distance for these — a kicked ball can reappear
-# anywhere — and the detector caps them at one detection per frame to prevent
-# false positives from spawning phantom parallel tracks.
-_SINGLE_INSTANCE_CLASSES = {"sports ball", "frisbee"}
+# EMA weight for output box smoothing (higher = less lag, more jitter)
+_SMOOTH = 0.75
+# Minimum appearance similarity even during normal tracking
+_APP_FLOOR_TRACKING  = 0.35
+# Minimum appearance similarity during re-ID search
+_APP_FLOOR_REID      = 0.55
+# Minimum motion score during normal tracking
+_MOT_FLOOR_TRACKING  = 0.15
 
 
-def _stitch_tracks(
-    track_records: dict,
-    gap_tolerance: int,
-    max_pixel_dist: float,
-    overlap_tolerance: int = 0,
-) -> dict:
+# ── Geometry / similarity helpers ─────────────────────────────────────────────
+
+def _iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    ua = (a[2] - a[0]) * (a[3] - a[1])
+    ub = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (ua + ub - inter)
+
+
+def _centre_score(pred_box, cand_box, last_box) -> float:
     """
-    Greedy chain stitching: merge fragment tracks of the same class that are
-    within gap_tolerance frames (forward) or overlap_tolerance frames (backward)
-    and within max_pixel_dist pixels of the predecessor's last known position.
-
-    overlap_tolerance allows merging when a new Deep SORT track is confirmed
-    while the old track is still coasting (small negative gap).
-
-    Returns id_remap: {raw_track_id -> canonical_track_id}.
-    Canonical ID is always the earliest fragment in each chain.
+    Score in [0, 1] based on how close the candidate centre is to the
+    predicted centre, normalised by the object's own diagonal size.
+    Falls off linearly to 0 at 1.5× the object diagonal.
     """
-    if not track_records:
-        return {}
+    px = (pred_box[0] + pred_box[2]) / 2
+    py = (pred_box[1] + pred_box[3]) / 2
+    cx = (cand_box[0] + cand_box[2]) / 2
+    cy = (cand_box[1] + cand_box[3]) / 2
+    dist  = math.hypot(px - cx, py - cy)
+    diag  = math.hypot(last_box[2] - last_box[0], last_box[3] - last_box[1])
+    limit = max(diag * 1.5, 60)   # generous for small objects
+    return max(0.0, 1.0 - dist / limit)
 
-    # Group fragments by class
-    by_class: dict[str, list] = {}
-    for t in track_records.values():
-        by_class.setdefault(t["class"], []).append(t)
 
-    # Start with identity mapping
-    id_remap: dict[int, int] = {tid: tid for tid in track_records}
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    return float(np.dot(a, b) / (na * nb)) if na > 1e-8 and nb > 1e-8 else 0.0
 
-    for cls_tracks in by_class.values():
-        # Process in chronological order
-        cls_tracks.sort(key=lambda t: t["first_frame"])
 
-        # Single-instance detection: if no two raw tracks of this class ever
-        # overlap in time, only one physical object can exist at any moment.
-        # For such classes (e.g. a sports ball) the object may reappear anywhere
-        # in the frame after a kick or occlusion, so spatial distance is not a
-        # meaningful constraint — skip it and stitch on time alone.
-        is_single_instance = True
-        for _i in range(len(cls_tracks)):
-            for _j in range(_i + 1, len(cls_tracks)):
-                a, b = cls_tracks[_i], cls_tracks[_j]
-                if max(a["first_frame"], b["first_frame"]) <= min(a["last_frame"], b["last_frame"]):
-                    is_single_instance = False
-                    break
-            if not is_single_instance:
-                break
-        # Also force single-instance for known classes: a kicked ball can
-        # reappear anywhere, so spatial distance is never a valid stitch constraint.
-        force_single = bool(cls_tracks) and cls_tracks[0]["class"] in _SINGLE_INSTANCE_CLASSES
-        if is_single_instance or force_single:
-            # One physical object: no distance constraint, full gap budget.
-            effective_dist = float("inf")
-            effective_gap = gap_tolerance
-        else:
-            # Multiple objects of the same class share the pitch.  A generous
-            # gap or distance allows fragments from *different* people to be
-            # merged when they happen to be near the same position.
-            # Tight gap  = only stitch brief occlusions (≤ max_age frames).
-            # Tight dist = 10 % of diagonal keeps spatially close strangers apart.
-            effective_dist = max_pixel_dist * 0.4
-            effective_gap = max(gap_tolerance // 10, 5)
+def _embed(embedder, frame: np.ndarray, box) -> np.ndarray | None:
+    """Crop `box` from `frame` and return a unit-norm appearance embedding."""
+    x1 = max(0, int(box[0]));  y1 = max(0, int(box[1]))
+    x2 = min(frame.shape[1], int(box[2]));  y2 = min(frame.shape[0], int(box[3]))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    try:
+        result = embedder.predict([crop])
+        if result is None or len(result) == 0:
+            return None
+        v = np.array(result[0], dtype=np.float32)
+        n = np.linalg.norm(v)
+        return v / n if n > 1e-8 else v
+    except Exception:
+        return None
 
-        # Live chain metadata: canonical_id -> {last_frame, last_cx, last_cy}
-        # Updated after every merge so transitive chains work correctly.
-        chain: dict[int, dict] = {
-            t["id"]: {
-                "last_frame": t["last_frame"],
-                "last_cx": t["bboxes"][-1]["cx"] if t["bboxes"] else 0,
-                "last_cy": t["bboxes"][-1]["cy"] if t["bboxes"] else 0,
-            }
-            for t in cls_tracks
-        }
 
-        for j in range(1, len(cls_tracks)):
-            tb = cls_tracks[j]
-            first_cx = tb["bboxes"][0]["cx"] if tb["bboxes"] else 0
-            first_cy = tb["bboxes"][0]["cy"] if tb["bboxes"] else 0
+def _smooth(new_box, old_box, alpha: float = _SMOOTH):
+    """Exponential moving average on a bounding box (reduces YOLO jitter)."""
+    return [int(alpha * n + (1 - alpha) * o) for n, o in zip(new_box, old_box)]
 
-            best_root = None
-            best_last_frame = -1
 
-            # Search all earlier fragments for the best predecessor
-            for i in range(j):
-                ta = cls_tracks[i]
-                root_a = id_remap[ta["id"]]
-                meta = chain[root_a]
+def _predict_box(last_box: list, history: list) -> list:
+    """
+    Weighted-velocity prediction of the next bounding box.
+    Uses up to the last 4 centre-point displacements, with exponentially
+    higher weights on more-recent moves.
+    Returns a shifted copy of last_box centred on the predicted position.
+    """
+    if len(history) < 2:
+        return last_box
 
-                gap = tb["first_frame"] - meta["last_frame"]
-                if gap > effective_gap:
-                    continue
-                # For single-instance classes any backward overlap is a tracking
-                # artifact — there is only one physical object, so waive the limit.
-                if not force_single and gap < -overlap_tolerance:
-                    continue
+    pts = history[-5:]          # at most 4 velocity vectors from 5 points
+    diffs = [
+        (pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        for i in range(len(pts) - 1)
+    ]
+    weights = [2 ** i for i in range(len(diffs))]   # recent moves weighted higher
+    total_w = sum(weights)
+    vx = sum(d[0] * w for d, w in zip(diffs, weights)) / total_w
+    vy = sum(d[1] * w for d, w in zip(diffs, weights)) / total_w
 
-                dist = math.hypot(meta["last_cx"] - first_cx, meta["last_cy"] - first_cy)
-                if dist <= effective_dist and meta["last_frame"] > best_last_frame:
-                    best_last_frame = meta["last_frame"]
-                    best_root = root_a
+    cx_pred = pts[-1][0] + vx
+    cy_pred = pts[-1][1] + vy
+    w = last_box[2] - last_box[0]
+    h = last_box[3] - last_box[1]
+    return [
+        int(cx_pred - w / 2), int(cy_pred - h / 2),
+        int(cx_pred + w / 2), int(cy_pred + h / 2),
+    ]
 
-            if best_root is not None:
-                # Merge tb into best_root chain
-                id_remap[tb["id"]] = best_root
-                # Update canonical metadata so future fragments can extend this chain
-                if tb["last_frame"] > chain[best_root]["last_frame"]:
-                    chain[best_root]["last_frame"] = tb["last_frame"]
-                    if tb["bboxes"]:
-                        chain[best_root]["last_cx"] = tb["bboxes"][-1]["cx"]
-                        chain[best_root]["last_cy"] = tb["bboxes"][-1]["cy"]
 
-    return id_remap
+# ── Preview (populates the Select step in the UI) ────────────────────────────
 
+def preview_frame(input_path: str, confidence: float = 0.45) -> tuple:
+    """
+    Extract the first frame, run YOLO on it, and return
+    (frame_bgr, detections).  detections is a list of
+    {x1, y1, x2, y2, confidence, class_name}.
+    """
+    detector = YOLODetector(confidence=confidence)
+    cap = cv2.VideoCapture(input_path)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError(f"Cannot read first frame from: {input_path}")
+
+    raw = detector.detect(frame)
+    detections = []
+    for det in raw:
+        x1, y1, x2, y2, conf, cls_id = det
+        detections.append({
+            "x1":         int(x1),
+            "y1":         int(y1),
+            "x2":         int(x2),
+            "y2":         int(y2),
+            "confidence": round(float(conf), 3),
+            "class_name": detector.get_class_name(int(cls_id)),
+        })
+    return frame, detections
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def process_video(
     input_path: str,
     output_video_path: str,
     output_json_path: str,
+    selected_boxes: list,
     confidence: float = 0.5,
     max_age: int = 30,
     min_hits: int = 3,
     progress_callback=None,
 ) -> dict:
     """
-    Full detection + tracking pipeline with post-hoc track stitching.
-    Pass 1: run YOLO + Deep SORT, collect raw per-frame detections.
-    Stitch: merge fragmented tracks of the same class via greedy chain matching.
-    Pass 2: redraw video with canonical (stitched) IDs and trajectories.
-    Returns a summary dict with stats.
+    Track 1–2 pre-selected object instances through a video.
+
+    selected_boxes — [{x1, y1, x2, y2, class_name}, …] (1 or 2 entries).
+    confidence     — YOLO detection threshold.
+    max_age        — frames without a match before entering re-ID mode.
+    min_hits       — consecutive appearance matches to confirm re-ID.
     """
+    if not selected_boxes:
+        raise ValueError("At least one target box must be selected.")
+
+    n        = len(selected_boxes)
     detector = YOLODetector(confidence=confidence)
-    tracker = DeepSort(max_age=max_age, n_init=min_hits)
+
+    # DeepSort is instantiated only to access its MobileNetV2 embedder.
+    _ds      = DeepSort(max_age=1)
+    embedder = _ds.embedder
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {input_path}")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # ── Pass 1: detect + track, collect raw data ──────────────────────────────
-    # raw_frames: frame_idx -> list of {id, class, x1,y1,x2,y2, cx,cy}
-    raw_frames: dict[int, list] = {}
-    track_records: dict[int, dict] = {}
+    # ── Per-target state ──────────────────────────────────────────────────────
+    last_box          = [[sb["x1"], sb["y1"], sb["x2"], sb["y2"]] for sb in selected_boxes]
+    smooth_box        = [list(b) for b in last_box]   # EMA-smoothed output box
+    embeddings        = [None] * n                    # running-average appearance
+    init_embeddings   = [None] * n                    # frozen frame-0 reference (never updated)
+    pos_history       = [[] for _ in range(n)]        # [(cx, cy), …] for velocity
+    lost_cnt          = [0]   * n
+    searching         = [False] * n
+    reid_hits         = [0]   * n
+    was_lost          = [False] * n
+    reapp_cnt         = [0]   * n
+
+    target_frames: list[dict] = [{} for _ in range(n)]
+
+    # ── Frame 0: seed embeddings and record initial positions ─────────────────
+    ret0, frame0 = cap.read()
+    if not ret0:
+        raise RuntimeError("Cannot read first frame.")
+
+    for t, box in enumerate(last_box):
+        emb = _embed(embedder, frame0, box)
+        embeddings[t]      = emb
+        init_embeddings[t] = emb   # frozen — never updated after this point
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        cx0, cy0 = (x1 + x2) // 2, (y1 + y2) // 2
+        pos_history[t] = [(cx0, cy0)]
+        target_frames[t][0] = {
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "cx": cx0, "cy": cy0,
+        }
+
+    if progress_callback and total_frames > 0:
+        progress_callback(0)
 
     start_time = time.time()
-    frame_idx = 0
+    frame_idx  = 1
 
+    # ── Main tracking pass (frames 1 … end) ───────────────────────────────────
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Run at ball-sensitive floor so motion-blur frames still reach Deep SORT;
-        # non-ball classes are filtered back up to the user's threshold.
-        detections_raw = detector.detect(frame, override_conf=min(confidence, _BALL_CONF_FLOOR))
+        # Use a lower confidence floor than the user's threshold so the
+        # target is still detected when partially occluded or at distance.
+        # The combined IoU + appearance score filters false positives.
+        raw_dets   = detector.detect(frame, override_conf=min(confidence, 0.30))
+        candidates = [
+            {
+                "box":   [int(d[0]), int(d[1]), int(d[2]), int(d[3])],
+                "conf":  float(d[4]),
+                "class": detector.get_class_name(int(d[5])),
+            }
+            for d in raw_dets
+        ]
 
-        ds_input = []
-        _best_single: dict[str, tuple] = {}
-        for det in detections_raw:
-            x1, y1, x2, y2, conf, cls_id = det
-            class_name = detector.get_class_name(int(cls_id))
-            if conf < confidence and class_name not in _SINGLE_INSTANCE_CLASSES:
-                continue
-            w, h = x2 - x1, y2 - y1
-            entry = ([x1, y1, w, h], conf, class_name)
-            if class_name in _SINGLE_INSTANCE_CLASSES:
-                # Keep only the highest-confidence detection per frame so
-                # misidentified objects never create phantom parallel tracks.
-                if class_name not in _best_single or conf > _best_single[class_name][1]:
-                    _best_single[class_name] = entry
-            else:
-                ds_input.append(entry)
-        ds_input.extend(_best_single.values())
+        # Pre-compute embeddings for all candidates once (shared across targets)
+        cand_embs = [_embed(embedder, frame, c["box"]) for c in candidates]
 
-        tracks = tracker.update_tracks(ds_input, frame=frame)
+        used: set[int] = set()
 
-        frame_dets = []
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-            if track.time_since_update > 0:
-                continue
+        for t in range(n):
+            best_i, best_score = None, -1.0
+            pred_box     = _predict_box(last_box[t], pos_history[t])
+            target_class = selected_boxes[t].get("class_name", "")
 
-            track_id = int(track.track_id)
-            ltrb = track.to_ltrb()
-            x1, y1, x2, y2 = int(ltrb[0]), int(ltrb[1]), int(ltrb[2]), int(ltrb[3])
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            class_name = track.get_det_class() or "object"
+            for ci, cand in enumerate(candidates):
+                if ci in used:
+                    continue
+                # Only consider same-class detections — prevents snapping to
+                # cars, balls, etc. when the selected target is a person.
+                if target_class and cand["class"] != target_class:
+                    continue
+                box = cand["box"]
 
-            frame_dets.append({
-                "id": track_id, "class": class_name,
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "cx": cx, "cy": cy,
-            })
+                if not searching[t]:
+                    # ── TRACKING: spatial gate → motion + appearance ──────────
+                    #
+                    # Spatial gate: compute the distance between the candidate
+                    # centre and the predicted centre.  Only candidates inside
+                    # an adaptive search window are scored at all.  This is the
+                    # primary defence against lookalike objects elsewhere in the
+                    # frame — a different player wearing the same kit on the far
+                    # side of the pitch is excluded before appearance is checked.
+                    pred_cx = (pred_box[0] + pred_box[2]) / 2
+                    pred_cy = (pred_box[1] + pred_box[3]) / 2
+                    cand_cx = (box[0] + box[2]) / 2
+                    cand_cy = (box[1] + box[3]) / 2
+                    centre_dist = math.hypot(pred_cx - cand_cx, pred_cy - cand_cy)
 
-            if track_id not in track_records:
-                track_records[track_id] = {
-                    "id": track_id, "class": class_name,
-                    "first_frame": frame_idx, "last_frame": frame_idx,
-                    "bboxes": [],
+                    obj_diag = math.hypot(
+                        last_box[t][2] - last_box[t][0],
+                        last_box[t][3] - last_box[t][1],
+                    )
+                    vel_mag = 0.0
+                    if len(pos_history[t]) >= 2:
+                        ph = pos_history[t]
+                        vel_mag = math.hypot(
+                            ph[-1][0] - ph[-2][0],
+                            ph[-1][1] - ph[-2][1],
+                        )
+                    # Base = 90 % of object diagonal (tight when stationary).
+                    # Extra = 2 × last-frame velocity (expands for fast movers).
+                    # Floor = 40 px so tiny objects still have a usable window.
+                    search_radius = max(obj_diag * 0.9, 40.0) + vel_mag * 2.0
+
+                    if centre_dist > search_radius:
+                        continue   # lookalike too far away — skip entirely
+
+                    # Size-consistency gate: reject candidates whose bounding
+                    # box is more than 2.5× larger or smaller than the target.
+                    # Two players of the same kit can be told apart by depth/
+                    # distance to camera; a sudden 3× size jump is not the
+                    # same person.
+                    ref_w = max(last_box[t][2] - last_box[t][0], 1)
+                    ref_h = max(last_box[t][3] - last_box[t][1], 1)
+                    cnd_w = max(box[2] - box[0], 1)
+                    cnd_h = max(box[3] - box[1], 1)
+                    if max(ref_w / cnd_w, cnd_w / ref_w) > 2.5:
+                        continue
+                    if max(ref_h / cnd_h, cnd_h / ref_h) > 2.5:
+                        continue
+
+                    iou_pred  = _iou(pred_box, box)
+                    iou_last  = _iou(last_box[t], box)
+                    cent      = _centre_score(pred_box, box, last_box[t])
+                    mot_score = max(iou_pred, iou_last * 0.85, cent * 0.70)
+
+                    # Appearance: blend running embedding with the frozen
+                    # frame-0 reference so accumulated drift cannot push the
+                    # score decisively toward a different individual.
+                    app_score = 0.0
+                    if cand_embs[ci] is not None:
+                        sims = []
+                        if embeddings[t]      is not None:
+                            sims.append(_cosine_sim(embeddings[t],      cand_embs[ci]))
+                        if init_embeddings[t] is not None:
+                            sims.append(_cosine_sim(init_embeddings[t], cand_embs[ci]))
+                        if sims:
+                            # Weight the frozen reference more heavily toward
+                            # the end to resist long-term drift.
+                            app_score = max(0.0, max(sims))
+
+                    # Reject candidates that fail both motion AND appearance
+                    if mot_score < _MOT_FLOOR_TRACKING and app_score < _APP_FLOOR_TRACKING:
+                        continue
+
+                    if app_score > 0.0:
+                        score = 0.65 * mot_score + 0.35 * app_score
+                    else:
+                        score = mot_score
+
+                    if score > best_score:
+                        best_score, best_i = score, ci
+
+                else:
+                    # ── SEARCHING: appearance-only re-ID ─────────────────────
+                    if cand_embs[ci] is not None:
+                        sims = []
+                        if embeddings[t]      is not None:
+                            sims.append(_cosine_sim(embeddings[t],      cand_embs[ci]))
+                        if init_embeddings[t] is not None:
+                            sims.append(_cosine_sim(init_embeddings[t], cand_embs[ci]))
+                        if sims:
+                            score = max(sims)
+                            if score > _APP_FLOOR_REID and score > best_score:
+                                best_score, best_i = score, ci
+
+            # ── Process match result ──────────────────────────────────────────
+            if best_i is not None:
+                raw_box = candidates[best_i]["box"]
+
+                if searching[t]:
+                    # Gate re-ID by min_hits consecutive matches
+                    reid_hits[t] += 1
+                    used.add(best_i)
+                    if reid_hits[t] < min_hits:
+                        continue
+                    if was_lost[t]:
+                        reapp_cnt[t] += 1
+                    searching[t]  = False
+                    reid_hits[t]  = 0
+                    was_lost[t]   = False
+                    smooth_box[t] = list(raw_box)   # reset smoother on re-ID
+                else:
+                    used.add(best_i)
+
+                # Smooth the output box (reduces YOLO jitter)
+                smooth_box[t] = _smooth(raw_box, smooth_box[t])
+                last_box[t]   = raw_box             # velocity tracking uses raw
+                lost_cnt[t]   = 0
+
+                sx1, sy1, sx2, sy2 = smooth_box[t]
+                scx, scy = (sx1 + sx2) // 2, (sy1 + sy2) // 2
+                cx_raw = (raw_box[0] + raw_box[2]) // 2
+                cy_raw = (raw_box[1] + raw_box[3]) // 2
+                pos_history[t] = (pos_history[t] + [(cx_raw, cy_raw)])[-20:]
+
+                # Update running embedding only on high-confidence matches
+                # and with a very slow EMA (5 %) to resist long-term drift.
+                # The frozen init_embedding is never updated.
+                new_emb = cand_embs[best_i]
+                if new_emb is not None and best_score > 0.70:
+                    if embeddings[t] is None:
+                        embeddings[t] = new_emb
+                    else:
+                        upd  = 0.95 * embeddings[t] + 0.05 * new_emb
+                        norm = np.linalg.norm(upd)
+                        embeddings[t] = upd / norm if norm > 1e-8 else upd
+
+                target_frames[t][frame_idx] = {
+                    "x1": sx1, "y1": sy1, "x2": sx2, "y2": sy2,
+                    "cx": scx, "cy": scy,
                 }
-            track_records[track_id]["last_frame"] = frame_idx
-            track_records[track_id]["bboxes"].append({
-                "frame": frame_idx,
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "cx": cx, "cy": cy,
-            })
 
-        raw_frames[frame_idx] = frame_dets
+            else:
+                lost_cnt[t] += 1
+
+                # Ghost tracking: during a brief loss (≤ 8 frames, e.g. two
+                # objects crossing) advance last_box and pos_history using the
+                # last known velocity.  This keeps the search window moving
+                # along the correct trajectory so that when the objects
+                # separate, the spatial gate finds the one that exited on the
+                # expected side — not the lookalike going the other direction.
+                if not searching[t] and lost_cnt[t] <= 8 and len(pos_history[t]) >= 2:
+                    ph = pos_history[t]
+                    vx = ph[-1][0] - ph[-2][0]
+                    vy = ph[-1][1] - ph[-2][1]
+                    cx_g = int(ph[-1][0] + vx)
+                    cy_g = int(ph[-1][1] + vy)
+                    w = last_box[t][2] - last_box[t][0]
+                    h = last_box[t][3] - last_box[t][1]
+                    last_box[t] = [
+                        cx_g - w // 2, cy_g - h // 2,
+                        cx_g + w // 2, cy_g + h // 2,
+                    ]
+                    pos_history[t] = (pos_history[t] + [(cx_g, cy_g)])[-20:]
+
+                if lost_cnt[t] > max_age and not searching[t]:
+                    searching[t]  = True
+                    was_lost[t]   = True
+                    reid_hits[t]  = 0
+
         frame_idx += 1
-
         if progress_callback and total_frames > 0:
-            # Pass 1 = first 50 % of reported progress
             progress_callback(int(frame_idx / total_frames * 50))
 
     cap.release()
+    total_processed = frame_idx
 
-    # ── Stitch ────────────────────────────────────────────────────────────────
-    # gap_tolerance: 10× max_age covers occlusions up to ~10 s at 30 fps.
-    # pixel_dist: 25 % of the diagonal — allows fast-moving objects to reappear
-    # nearby without merging spatially distant distinct objects of the same class.
-    # overlap_tolerance: 3 frames handles detection jitter where Deep SORT
-    # confirms a new track just before the old coast window fully expires.
-    stitch_gap = max_age * 10
-    stitch_dist = 0.25 * math.hypot(width, height)
-    id_remap = _stitch_tracks(track_records, stitch_gap, stitch_dist, overlap_tolerance=3)
-
-    # ── Pass 2: redraw video with canonical IDs ───────────────────────────────
-    cap2 = cv2.VideoCapture(input_path)
+    # ── Pass 2: annotate and write output video ───────────────────────────────
+    cap2   = cv2.VideoCapture(input_path)
     fourcc = cv2.VideoWriter_fourcc(*"avc1")
     writer = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
 
-    # Trajectory history keyed by canonical ID: id -> [(frame_idx, cx, cy)]
-    trajectories: dict[int, list] = {}
-    # Canonical track records (for summary)
-    canonical_records: dict[int, dict] = {}
+    trajectories:  list[list] = [[] for _ in range(n)]
     frame_records: list[dict] = []
-
     frame_idx = 0
+
     while True:
         ret, frame = cap2.read()
         if not ret:
             break
 
-        frame_dets = raw_frames.get(frame_idx, [])
         frame_track_list = []
 
-        for det in frame_dets:
-            raw_id = det["id"]
-            can_id = id_remap.get(raw_id, raw_id)
+        for t in range(n):
+            det = target_frames[t].get(frame_idx)
+            if det is None:
+                continue
+
             x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
-            cx, cy = det["cx"], det["cy"]
-            class_name = det["class"]
-            color = _color_for_id(can_id)
+            cx, cy  = det["cx"], det["cy"]
+            color   = TARGET_COLORS[t % len(TARGET_COLORS)]
+            label   = f"T{t + 1}"
 
-            # Accumulate trajectory
-            if can_id not in trajectories:
-                trajectories[can_id] = []
-            trajectories[can_id].append((frame_idx, cx, cy))
-
-            # Accumulate canonical record
-            if can_id not in canonical_records:
-                canonical_records[can_id] = {
-                    "id": can_id, "class": class_name,
-                    "first_frame": frame_idx, "last_frame": frame_idx,
-                    "bboxes": [],
-                }
-            canonical_records[can_id]["last_frame"] = frame_idx
-            canonical_records[can_id]["bboxes"].append({
-                "frame": frame_idx,
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "cx": cx, "cy": cy,
-            })
-
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Draw label
-            label = f"ID:{can_id} {class_name}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-
-            # Draw trajectory — skip segments where frames are not consecutive
-            hist = trajectories[can_id][-120:]
+            # Trajectory — only connect consecutive detected frames
+            trajectories[t].append((frame_idx, cx, cy))
+            hist = trajectories[t][-120:]
             for i in range(1, len(hist)):
-                f_prev, xp, yp = hist[i - 1]
-                f_curr, xc, yc = hist[i]
-                if f_curr - f_prev <= 1:
+                fp, xp, yp = hist[i - 1]
+                fc, xc, yc = hist[i]
+                if fc - fp <= 1:
                     cv2.line(frame, (xp, yp), (xc, yc), color, 2)
 
-            frame_track_list.append({
-                "id": can_id, "class": class_name,
-                "bbox": [x1, y1, x2, y2],
-            })
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 8, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 4, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
+
+            frame_track_list.append({"target": t + 1, "bbox": [x1, y1, x2, y2]})
 
         frame_records.append({"frame": frame_idx, "tracks": frame_track_list})
         writer.write(frame)
         frame_idx += 1
 
         if progress_callback and total_frames > 0:
-            # Pass 2 = second 50 % of reported progress
             progress_callback(50 + int(frame_idx / total_frames * 50))
 
     cap2.release()
     writer.release()
-
     elapsed = round(time.time() - start_time, 2)
 
-    # Summary uses canonical records (post-stitch)
-    class_counts: dict[str, int] = {}
-    for rec in canonical_records.values():
-        c = rec["class"]
-        class_counts[c] = class_counts.get(c, 0) + 1
+    # ── Per-target analytics ──────────────────────────────────────────────────
+    target_summaries = []
+    for t in range(n):
+        frames_seen = sorted(target_frames[t])
+        n_seen      = len(frames_seen)
 
-    durations = [
-        r["last_frame"] - r["first_frame"] + 1
-        for r in canonical_records.values()
-    ]
-    avg_duration = round(sum(durations) / len(durations), 1) if durations else 0
+        total_dist = 0.0
+        prev_cx, prev_cy = None, None
+        for fi in frames_seen:
+            d = target_frames[t][fi]
+            if prev_cx is not None:
+                total_dist += math.hypot(d["cx"] - prev_cx, d["cy"] - prev_cy)
+            prev_cx, prev_cy = d["cx"], d["cy"]
+
+        avg_speed    = round(total_dist / n_seen, 2) if n_seen > 1 else 0.0
+        presence_pct = round(n_seen / total_processed * 100, 1) if total_processed > 0 else 0.0
+
+        target_summaries.append({
+            "target_id":              t + 1,
+            "class_name":             selected_boxes[t].get("class_name", "object"),
+            "frames_detected":        n_seen,
+            "presence_percentage":    presence_pct,
+            "total_distance_pixels":  round(total_dist, 1),
+            "avg_speed_px_per_frame": avg_speed,
+            "reappearances":          reapp_cnt[t],
+            "bboxes": [
+                {"frame": fi, **target_frames[t][fi]}
+                for fi in frames_seen
+            ],
+        })
 
     summary = {
-        "total_frames": frame_idx,
-        "fps": round(fps, 2),
-        "total_objects": len(canonical_records),
-        "class_counts": class_counts,
-        "avg_track_duration_frames": avg_duration,
+        "total_frames":            total_processed,
+        "fps":                     round(fps, 2),
+        "total_objects":           n,
+        "targets":                 target_summaries,
         "processing_time_seconds": elapsed,
-        "tracks": list(canonical_records.values()),
-        "frame_records": frame_records,
+        "frame_records":           frame_records,
     }
 
     with open(output_json_path, "w", encoding="utf-8") as f:

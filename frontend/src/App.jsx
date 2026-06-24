@@ -1,20 +1,24 @@
 import { useState } from 'react'
-import UploadPanel from './components/UploadPanel'
-import ConfigPanel from './components/ConfigPanel'
+import UploadPanel     from './components/UploadPanel'
+import SelectPanel     from './components/SelectPanel'
+import ConfigPanel     from './components/ConfigPanel'
 import ProcessingPanel from './components/ProcessingPanel'
-import ResultsView from './components/ResultsView'
+import ResultsView     from './components/ResultsView'
 import './index.css'
 
 const API = 'http://localhost:8000'
 
-const STEPS = ['Upload', 'Configure', 'Process', 'Results']
-const STEP_KEYS = ['upload', 'config', 'processing', 'results']
+const STEPS     = ['Upload', 'Select', 'Configure', 'Process', 'Results']
+const STEP_KEYS = ['upload', 'select',  'config',    'processing', 'results']
 
 function CrosshairIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="8"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/>
-      <line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/>
+      <circle cx="12" cy="12" r="8"/>
+      <line x1="12" y1="2"  x2="12" y2="6"/>
+      <line x1="12" y1="18" x2="12" y2="22"/>
+      <line x1="2"  y1="12" x2="6"  y2="12"/>
+      <line x1="18" y1="12" x2="22" y2="12"/>
     </svg>
   )
 }
@@ -54,19 +58,22 @@ function Stepper({ current }) {
 }
 
 export default function App() {
-  const [videoId, setVideoId] = useState(null)
-  const [filename, setFilename] = useState('')
-  const [jobId, setJobId] = useState(null)
-  const [jobStatus, setJobStatus] = useState(null)
-  const [progress, setProgress] = useState(0)
-  const [summary, setSummary] = useState(null)
-  const [jobError, setJobError] = useState('')
-  const [config, setConfig] = useState({ confidence: 0.5, max_age: 90, min_hits: 3 })
+  const [videoId,       setVideoId]       = useState(null)
+  const [filename,      setFilename]      = useState('')
+  const [selectedBoxes, setSelectedBoxes] = useState([])   // 1–2 {x1,y1,x2,y2,class_name}
+  const [jobId,         setJobId]         = useState(null)
+  const [jobStatus,     setJobStatus]     = useState(null)
+  const [progress,      setProgress]      = useState(0)
+  const [summary,       setSummary]       = useState(null)
+  const [jobError,      setJobError]      = useState('')
+  const [config,        setConfig]        = useState({ confidence: 0.60, max_age: 90, min_hits: 3 })
 
-  const step = !videoId ? 'upload'
-    : !jobId ? 'config'
-    : jobStatus !== 'done' ? 'processing'
-    : 'results'
+  // Derive current step from state — no way for UI and data to diverge
+  const step = !videoId              ? 'upload'
+             : !selectedBoxes.length ? 'select'
+             : !jobId                ? 'config'
+             : jobStatus !== 'done'  ? 'processing'
+             :                        'results'
 
   async function handleUpload(file) {
     const form = new FormData()
@@ -78,11 +85,15 @@ export default function App() {
     setFilename(data.filename)
   }
 
+  function handleSelect(boxes) {
+    setSelectedBoxes(boxes)
+  }
+
   async function handleProcess() {
     const res = await fetch(`${API}/api/process/${videoId}`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
+      body:    JSON.stringify({ ...config, selected_boxes: selectedBoxes }),
     })
     if (!res.ok) throw new Error(await res.text())
     const data = await res.json()
@@ -102,7 +113,7 @@ export default function App() {
         setJobStatus(msg.status)
         setProgress(msg.progress ?? 0)
         if (msg.summary) setSummary(msg.summary)
-        if (msg.error) setJobError(msg.error)
+        if (msg.error)   setJobError(msg.error)
       }
       if (msg.type === 'done') {
         setJobStatus('done')
@@ -114,8 +125,10 @@ export default function App() {
   }
 
   function handleReset() {
-    setVideoId(null); setFilename(''); setJobId(null)
-    setJobStatus(null); setProgress(0); setSummary(null); setJobError('')
+    setVideoId(null);       setFilename('')
+    setSelectedBoxes([]);   setJobId(null)
+    setJobStatus(null);     setProgress(0)
+    setSummary(null);       setJobError('')
   }
 
   return (
@@ -138,14 +151,25 @@ export default function App() {
             <UploadPanel onUpload={handleUpload} />
           </div>
         )}
+        {step === 'select' && (
+          <div className="panel-enter">
+            <SelectPanel
+              videoId={videoId}
+              api={API}
+              onSelect={handleSelect}
+              onBack={handleReset}
+            />
+          </div>
+        )}
         {step === 'config' && (
           <div className="panel-enter">
             <ConfigPanel
               filename={filename}
+              selectedBoxes={selectedBoxes}
               config={config}
               setConfig={setConfig}
               onProcess={handleProcess}
-              onBack={handleReset}
+              onBack={() => setSelectedBoxes([])}
             />
           </div>
         )}
@@ -162,7 +186,7 @@ export default function App() {
       </main>
 
       <footer className="app-footer">
-        YOLOv8 · Deep SORT · Real-time multi-object tracking
+        YOLOv8 · Appearance Re-ID · Focused instance tracking
       </footer>
     </div>
   )

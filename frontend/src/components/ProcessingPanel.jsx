@@ -24,10 +24,10 @@ function CircleIcon() {
 
 const STAGES = [
   'Frame extraction',
-  'YOLOv8 object detection',
-  'Deep SORT tracking',
-  'Trajectory annotation',
-  'Generating output',
+  'YOLO candidate detection',
+  'IoU / appearance matching',
+  'Re-identification scan',
+  'Generating annotated output',
 ]
 
 export default function ProcessingPanel({ progress, status, errorMsg }) {

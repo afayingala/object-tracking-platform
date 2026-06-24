@@ -48,11 +48,13 @@ function AlertIcon() {
   )
 }
 
+const TARGET_COLOURS = ['#ffc800', '#0090ff']
+
 const SLIDERS = [
   {
     field: 'confidence',
     label: 'Detection Confidence',
-    desc: 'Minimum confidence score for a detection to be accepted. Higher = fewer but more certain detections.',
+    desc:  'Minimum YOLO confidence score for a detection to be considered as a candidate match for the selected targets. Higher = fewer but more certain detections.',
     min: 0.1, max: 0.95, step: 0.05,
     Icon: TargetIcon,
     fmt: v => v.toFixed(2),
@@ -61,7 +63,7 @@ const SLIDERS = [
   {
     field: 'max_age',
     label: 'Max Track Age',
-    desc: 'Frames to keep a track alive without a detection before terminating it. Raise this for objects that disappear behind occlusions (e.g. 90–300 for sports).',
+    desc:  'Frames without a detection match before switching from IoU tracking to appearance-based re-identification. Higher values allow longer occlusions before re-ID kicks in.',
     min: 1, max: 300, step: 1,
     Icon: ClockIcon,
     fmt: v => `${v}f`,
@@ -69,8 +71,8 @@ const SLIDERS = [
   },
   {
     field: 'min_hits',
-    label: 'Min Confirmation Hits',
-    desc: 'Consecutive detections required before a new track is confirmed and displayed.',
+    label: 'Re-ID Confirmation Hits',
+    desc:  'Consecutive high-similarity appearance matches required to confirm a re-identification after a long absence. Higher = more confident re-ID, lower = faster re-acquisition.',
     min: 1, max: 10, step: 1,
     Icon: CheckCircleIcon,
     fmt: v => String(v),
@@ -78,22 +80,33 @@ const SLIDERS = [
   },
 ]
 
-export default function ConfigPanel({ filename, config, setConfig, onProcess, onBack }) {
+export default function ConfigPanel({ filename, selectedBoxes, config, setConfig, onProcess, onBack }) {
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [error,   setError]   = useState('')
 
   async function handleStart() {
     setError('')
     setLoading(true)
     try { await onProcess() }
     catch (e) { setError(e.message || 'Failed to start processing.') }
-    finally { setLoading(false) }
+    finally   { setLoading(false) }
   }
 
   return (
     <div className="glass panel">
       <h2 className="panel-title">Tune the <span className="grad-text">tracker</span></h2>
       <p className="panel-sub mono" style={{ fontSize: '0.78rem' }}>{filename}</p>
+
+      {/* Selected targets summary */}
+      <div className="config-targets-row">
+        {selectedBoxes.map((box, i) => (
+          <div key={i} className="config-target-chip" style={{ borderColor: TARGET_COLOURS[i], background: `${TARGET_COLOURS[i]}18` }}>
+            <span className="config-target-dot" style={{ background: TARGET_COLOURS[i] }} />
+            <span className="config-target-label">Target {i + 1}</span>
+            <span className="config-target-class mono">{box.class_name}</span>
+          </div>
+        ))}
+      </div>
 
       <div className="config-cards">
         {SLIDERS.map(({ field, label, desc, min, max, step, Icon, fmt, minLabel, maxLabel }) => (
@@ -122,15 +135,13 @@ export default function ConfigPanel({ filename, config, setConfig, onProcess, on
       </div>
 
       {error && (
-        <div className="error-pill">
-          <AlertIcon />{error}
-        </div>
+        <div className="error-pill"><AlertIcon />{error}</div>
       )}
 
       <div className="btn-row">
         <button className="btn btn-ghost" onClick={onBack}><ArrowLeftIcon />Back</button>
         <button className="btn btn-primary" onClick={handleStart} disabled={loading}>
-          <PlayIcon />{loading ? 'Starting…' : 'Start processing'}
+          <PlayIcon />{loading ? 'Starting…' : 'Start tracking'}
         </button>
       </div>
     </div>
