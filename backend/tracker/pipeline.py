@@ -459,7 +459,6 @@ def process_video(
     fourcc = cv2.VideoWriter_fourcc(*"avc1")
     writer = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
 
-    trajectories:  list[list] = [[] for _ in range(n)]
     frame_records: list[dict] = []
     frame_idx = 0
 
@@ -479,15 +478,6 @@ def process_video(
             cx, cy  = det["cx"], det["cy"]
             color   = TARGET_COLORS[t % len(TARGET_COLORS)]
             label   = f"T{t + 1}"
-
-            # Trajectory — only connect consecutive detected frames
-            trajectories[t].append((frame_idx, cx, cy))
-            hist = trajectories[t][-120:]
-            for i in range(1, len(hist)):
-                fp, xp, yp = hist[i - 1]
-                fc, xc, yc = hist[i]
-                if fc - fp <= 1:
-                    cv2.line(frame, (xp, yp), (xc, yc), color, 2)
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)

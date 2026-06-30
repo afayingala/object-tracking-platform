@@ -1,4 +1,5 @@
 import os
+import json
 import base64
 import uuid
 import asyncio
@@ -202,6 +203,74 @@ def download_json(job_id: str):
     if not path.exists():
         raise HTTPException(404, "Output JSON not found.")
     return FileResponse(str(path), media_type="application/json", filename="tracking_data.json")
+
+
+class Zone(BaseModel):
+    name: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+class ZoneAnalysisRequest(BaseModel):
+    zones: list[Zone]
+
+
+@app.post("/api/zone-analysis/{job_id}")
+def run_zone_analysis(job_id: str, request: ZoneAnalysisRequest):
+    path = OUTPUT_DIR / f"{job_id}_data.json"
+    if not path.exists():
+        raise HTTPException(404, "Tracking data not found.")
+
+    with open(path) as f:
+        data = json.load(f)
+
+    fps = data["fps"]
+    results = []
+
+    for target in data["targets"]:
+        target_zones = []
+        for zone in request.zones:
+            zx1 = min(zone.x1, zone.x2)
+            zy1 = min(zone.y1, zone.y2)
+            zx2 = max(zone.x1, zone.x2)
+            zy2 = max(zone.y1, zone.y2)
+
+            in_zone = False
+            frames_in_zone = 0
+            visit_count = 0
+            events = []
+
+            for bbox in target["bboxes"]:
+                cx, cy = bbox["cx"], bbox["cy"]
+                currently_in = zx1 <= cx <= zx2 and zy1 <= cy <= zy2
+
+                if currently_in:
+                    frames_in_zone += 1
+                    if not in_zone:
+                        visit_count += 1
+                        in_zone = True
+                        events.append({"type": "enter", "frame": bbox["frame"], "time_s": round(bbox["frame"] / fps, 2)})
+                else:
+                    if in_zone:
+                        events.append({"type": "exit", "frame": bbox["frame"], "time_s": round(bbox["frame"] / fps, 2)})
+                    in_zone = False
+
+            target_zones.append({
+                "zone_name": zone.name,
+                "frames_in_zone": frames_in_zone,
+                "dwell_seconds": round(frames_in_zone / fps, 2),
+                "visit_count": visit_count,
+                "events": events,
+            })
+
+        results.append({
+            "target_id": target["target_id"],
+            "class_name": target["class_name"],
+            "zones": target_zones,
+        })
+
+    return {"fps": fps, "targets": results}
 
 
 @app.websocket("/ws/{job_id}")

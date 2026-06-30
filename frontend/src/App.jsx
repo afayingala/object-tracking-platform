@@ -4,12 +4,13 @@ import SelectPanel     from './components/SelectPanel'
 import ConfigPanel     from './components/ConfigPanel'
 import ProcessingPanel from './components/ProcessingPanel'
 import ResultsView     from './components/ResultsView'
+import ZoneAnalysis    from './components/ZoneAnalysis'
 import './index.css'
 
 const API = 'http://localhost:8000'
 
-const STEPS     = ['Upload', 'Select', 'Configure', 'Process', 'Results']
-const STEP_KEYS = ['upload', 'select',  'config',    'processing', 'results']
+const STEPS     = ['Upload', 'Select', 'Configure', 'Process', 'Results', 'Zone Analysis']
+const STEP_KEYS = ['upload', 'select',  'config',    'processing', 'results', 'zones']
 
 function CrosshairIcon() {
   return (
@@ -67,12 +68,14 @@ export default function App() {
   const [summary,       setSummary]       = useState(null)
   const [jobError,      setJobError]      = useState('')
   const [config,        setConfig]        = useState({ confidence: 0.60, max_age: 90, min_hits: 3 })
+  const [showZones,     setShowZones]     = useState(false)
 
   // Derive current step from state — no way for UI and data to diverge
   const step = !videoId              ? 'upload'
              : !selectedBoxes.length ? 'select'
              : !jobId                ? 'config'
              : jobStatus !== 'done'  ? 'processing'
+             : showZones             ? 'zones'
              :                        'results'
 
   async function handleUpload(file) {
@@ -129,6 +132,7 @@ export default function App() {
     setSelectedBoxes([]);   setJobId(null)
     setJobStatus(null);     setProgress(0)
     setSummary(null);       setJobError('')
+    setShowZones(false)
   }
 
   return (
@@ -180,7 +184,24 @@ export default function App() {
         )}
         {step === 'results' && summary && (
           <div className="panel-enter">
-            <ResultsView summary={summary} jobId={jobId} api={API} onReset={handleReset} />
+            <ResultsView
+              summary={summary}
+              jobId={jobId}
+              videoId={videoId}
+              api={API}
+              onReset={handleReset}
+              onZoneAnalysis={() => setShowZones(true)}
+            />
+          </div>
+        )}
+        {step === 'zones' && (
+          <div className="panel-enter">
+            <ZoneAnalysis
+              jobId={jobId}
+              videoId={videoId}
+              api={API}
+              onBack={() => setShowZones(false)}
+            />
           </div>
         )}
       </main>

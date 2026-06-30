@@ -80,7 +80,15 @@ function TargetCard({ target, idx }) {
   )
 }
 
-export default function ResultsView({ summary, jobId, api, onReset }) {
+function MapPinIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>
+    </svg>
+  )
+}
+
+export default function ResultsView({ summary, jobId, videoId, api, onReset, onZoneAnalysis }) {
   const { total_frames, fps, total_objects, targets, processing_time_seconds } = summary
   const videoSrc = `${api}/api/download/video/${jobId}`
   const statMap  = { total_frames, fps, total_objects, processing_time_seconds }
@@ -146,6 +154,13 @@ export default function ResultsView({ summary, jobId, api, onReset }) {
             <div className="export-tile-meta">tracking_data.json</div>
           </div>
         </div>
+      </div>
+
+      <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'center' }}>
+        <button className="btn btn-primary" onClick={onZoneAnalysis} style={{ gap: '0.5rem', padding: '0.7rem 2rem', fontSize: '0.95rem' }}>
+          <MapPinIcon />
+          Zone Dwell Analysis
+        </button>
       </div>
     </div>
   )
